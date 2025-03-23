@@ -3,11 +3,19 @@
 # Configuration
 # =============
 
-# Max file size in bytes (default: 2MB)
+# Version information
+VERSION="1.1.0"
+LAST_UPDATED="2025-03-23 08:09:37"
+AUTHOR="jroth55"
+
+# Max file size in bytes (default: 1MB)
 MAX_FILE_SIZE=$((1024 * 1024))
 
+# Output format (markdown or xml)
+FORMAT="markdown"
+
 # Source directory (default: current directory)
-SOURCE_DIR=&quot;${1:-.}&quot;
+SOURCE_DIR="."
 
 # Excluded file extensions
 EXCLUDE_EXTENSIONS=(
@@ -23,39 +31,92 @@ EXCLUDE_DIRS=(
     build dist out .next coverage
 )
 
+# Initialize counters
+PROCESSED=0
+SKIPPED=0
+ERRORS=0
+
 # Error handling function
 die() {
-    echo &quot;ERROR: $1&quot; &gt;&amp;2
+    echo "ERROR: $1" >&2
     exit 1
 }
 
+# Print usage information
+usage() {
+    cat << EOF
+filesc - Files to Clipboard v${VERSION}
+Created by ${AUTHOR} | Last updated: ${LAST_UPDATED}
+
+USAGE:
+    filesc [OPTIONS] [DIRECTORY]
+
+OPTIONS:
+    -h, --help        Show this help message
+    -f, --format      Output format: markdown (default) or xml
+    -v, --version     Show version information
+
+EXAMPLES:
+    filesc                    # Copy files from current directory in markdown format
+    filesc /path/to/project   # Copy files from specified directory
+    filesc -f xml             # Copy files in XML format
+    
+EOF
+    exit 0
+}
+
+# Parse command line arguments
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -h|--help) usage ;;
+        -v|--version) echo "filesc v${VERSION}"; exit 0 ;;
+        -f|--format)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                die "Missing value for format option. Use 'markdown' or 'xml'"
+            elif [[ "$2" == "markdown" || "$2" == "xml" ]]; then
+                FORMAT="$2"
+                shift
+            else
+                die "Invalid format: $2. Use 'markdown' or 'xml'"
+            fi
+            ;;
+        -*) die "Unknown option: $1" ;;
+        *) SOURCE_DIR="$1" ;;
+    esac
+    shift
+done
+
 # Platform detection for clipboard command
-if command -v pbcopy &gt;/dev/null 2&gt;&amp;1; then
-    CLIP_CMD=&quot;pbcopy&quot;
-elif command -v xclip &gt;/dev/null 2&gt;&amp;1; then
-    CLIP_CMD=&quot;xclip -selection clipboard&quot;
-elif command -v clip &gt;/dev/null 2&gt;&amp;1; then
-    CLIP_CMD=&quot;clip&quot;
+if command -v pbcopy >/dev/null 2>&1; then
+    CLIP_CMD="pbcopy"
+elif command -v xclip >/dev/null 2>&1; then
+    CLIP_CMD="xclip -selection clipboard"
+elif command -v xsel >/dev/null 2>&1; then
+    CLIP_CMD="xsel --clipboard --input"
+elif command -v clip >/dev/null 2>&1; then
+    CLIP_CMD="clip"
+elif command -v clip.exe >/dev/null 2>&1; then
+    CLIP_CMD="clip.exe"
 else
-    die &quot;No clipboard command found. Install pbcopy (macOS), xclip (Linux), or clip (Windows)&quot;
+    die "No clipboard command found. Install pbcopy (macOS), xclip/xsel (Linux), or clip (Windows)"
 fi
 
 # Check for required commands
-command -v find &gt;/dev/null 2&gt;&amp;1 || die &quot;find command not available&quot;
+command -v find >/dev/null 2>&1 || die "find command not available"
 
 # Helper functions
 # ===============
 
 # Check if a file has an excluded extension
 has_excluded_extension() {
-    local file=&quot;$1&quot;
-    local ext=&quot;${file##*.}&quot;
+    local file="$1"
+    local ext="${file##*.}"
     
-    if [[ &quot;$ext&quot; != &quot;$file&quot; ]]; then
-        ext=&quot;.$ext&quot;
-        for excluded in &quot;${EXCLUDE_EXTENSIONS[@]}&quot;; do
-            if [[ &quot;$ext&quot; == &quot;$excluded&quot; ]]; then
-                echo &quot;Skipping (excluded extension): $file&quot; &gt;&amp;2
+    if [[ "$ext" != "$file" ]]; then
+        ext=".$ext"
+        for excluded in "${EXCLUDE_EXTENSIONS[@]}"; do
+            if [[ "$ext" == "$excluded" ]]; then
+                echo "Skipping (excluded extension): $file" >&2
                 return 0  # true, has excluded extension
             fi
         done
@@ -65,31 +126,45 @@ has_excluded_extension() {
 
 # Check if a file is in an excluded directory
 in_excluded_directory() {
-    local file=&quot;$1&quot;
+    local file="$1"
     
-    for dir in &quot;${EXCLUDE_DIRS[@]}&quot;; do
-        if [[ &quot;$file&quot; == *&quot;/$dir/&quot;* || &quot;$file&quot; == *&quot;/$dir&quot; ]]; then
-            echo &quot;Skipping (excluded directory): $file&quot; &gt;&amp;2
+    for dir in "${EXCLUDE_DIRS[@]}"; do
+        if [[ "$file" == *"/$dir/"* || "$file" == *"/$dir" ]]; then
+            echo "Skipping (excluded directory): $file" >&2
             return 0  # true, in excluded directory
         fi
     done
     return 1  # false, not in excluded directory
 }
 
-# Check if a file is binary (faster method)
+# Check if a file is binary (platform-compatible approach)
 is_binary() {
-    local file=&quot;$1&quot;
+    local file="$1"
     
-    # First check: look for null bytes as a quick binary indicator
-    if grep -q -m1 -P &quot;[\x00]&quot; &quot;$file&quot; 2&gt;/dev/null; then
-        echo &quot;Skipping (binary file): $file&quot; &gt;&amp;2
+    # Quick size check to avoid processing huge files
+    local size=0
+    if [[ "$(uname)" == "Darwin" ]]; then
+        size=$(stat -f%z "$file" 2>/dev/null || echo 0)
+    else
+        size=$(stat --format="%s" "$file" 2>/dev/null || echo 0)
+    fi
+    
+    if [[ $size -gt $((5*1024*1024)) ]]; then
+        echo "Skipping (very large file, assumed binary): $file" >&2
+        return 0  # true, too large to check, assume binary
+    fi
+    
+    # Check for null bytes in a platform-compatible way
+    if LC_ALL=C grep -q "$(printf '\000')" "$file" 2>/dev/null; then
+        echo "Skipping (binary file): $file" >&2
         return 0  # true, is binary
     fi
     
     # If file command is available, use it as a backup check
-    if command -v file &gt;/dev/null 2&gt;&amp;1; then
-        if file --mime &quot;$file&quot; 2&gt;/dev/null | grep -q &quot;charset=binary&quot;; then
-            echo &quot;Skipping (binary file): $file&quot; &gt;&amp;2
+    if command -v file >/dev/null 2>&1; then
+        # Check file output for binary indicators in a cross-platform way
+        if file "$file" 2>/dev/null | grep -q -E "binary|data|executable"; then
+            echo "Skipping (binary file): $file" >&2
             return 0  # true, is binary
         fi
     fi
@@ -99,31 +174,35 @@ is_binary() {
 
 # Check if a file is too large
 is_too_large() {
-    local file=&quot;$1&quot;
-    local size
+    local file="$1"
+    local size=0
     
-    if command -v stat &gt;/dev/null 2&gt;&amp;1; then
-        # Try macOS format first, then Linux format
-        size=$(stat -f%z &quot;$file&quot; 2&gt;/dev/null || stat --format=&quot;%s&quot; &quot;$file&quot; 2&gt;/dev/null)
+    # Get file size depending on platform
+    if [[ "$(uname)" == "Darwin" ]]; then
+        size=$(stat -f%z "$file" 2>/dev/null || echo 0)
     else
-        # Fallback to ls if stat is not available
-        size=$(ls -l &quot;$file&quot; 2&gt;/dev/null | awk &apos;{print $5}&apos;)
+        size=$(stat --format="%s" "$file" 2>/dev/null || echo 0)
     fi
     
-    # If we couldn&apos;t get the size, assume it&apos;s not too large
-    if [[ -z &quot;$size&quot; ]]; then
-        echo &quot;Warning: Could not determine size of $file, processing anyway&quot; &gt;&amp;2
+    # If stat failed, try ls as fallback
+    if [[ $size -eq 0 ]]; then
+        size=$(ls -l "$file" 2>/dev/null | awk '{print $5}' || echo 0)
+    fi
+    
+    # If we still couldn't get the size, assume it's not too large
+    if [[ $size -eq 0 ]]; then
+        echo "Warning: Could not determine size of $file, processing anyway" >&2
         return 1
     fi
     
     if [[ $size -gt $MAX_FILE_SIZE ]]; then
-        echo &quot;Skipping (file too large: ${size} bytes): $file&quot; &gt;&amp;2
+        echo "Skipping (file too large: ${size} bytes): $file" >&2
         return 0  # true, is too large
     fi
     
     # Skip empty files
     if [[ $size -eq 0 ]]; then
-        echo &quot;Skipping (empty file): $file&quot; &gt;&amp;2
+        echo "Skipping (empty file): $file" >&2
         return 0  # true, is empty
     fi
     
@@ -132,101 +211,329 @@ is_too_large() {
 
 # Function to get relative path
 get_relative_path() {
-    local full_path=&quot;$1&quot;
-    local rel_path=&quot;${full_path#$SOURCE_DIR/}&quot;
-    echo &quot;$rel_path&quot;
+    local full_path="$1"
+    
+    # Handle case when file is exactly the SOURCE_DIR
+    if [[ "$full_path" == "$SOURCE_DIR" ]]; then
+        basename "$full_path"
+        return
+    fi
+    
+    # Handle normal case
+    local rel_path="${full_path#$SOURCE_DIR/}"
+    
+    # If rel_path is same as full_path, fallback to basename
+    if [[ "$rel_path" == "$full_path" ]]; then
+        basename "$full_path"
+    else
+        echo "$rel_path"
+    fi
 }
 
-# Escape XML special characters
+# Safe read function - tries to detect encoding issues
+safe_read() {
+    local file="$1"
+    local output="$2"
+    
+    # Try to determine if file is valid UTF-8
+    if LC_ALL=C grep -q '[^\x00-\x7F]' "$file" 2>/dev/null; then
+        # File contains non-ASCII characters, check if it's valid UTF-8
+        if ! iconv -f UTF-8 -t UTF-8 < "$file" >/dev/null 2>&1; then
+            echo "Warning: File $file contains invalid UTF-8 characters, attempting to fix..." >&2
+            # Try to convert from common encodings
+            if iconv -f ISO-8859-1 -t UTF-8 < "$file" >> "$output" 2>/dev/null; then
+                return 0
+            elif iconv -f CP1252 -t UTF-8 < "$file" >> "$output" 2>/dev/null; then
+                return 0
+            else
+                echo "Error: Could not determine file encoding for $file" >&2
+                echo "[Content omitted due to encoding issues]" >> "$output"
+                return 1
+            fi
+        fi
+    fi
+    
+    # File is ASCII or valid UTF-8
+    cat "$file" >> "$output" 2>/dev/null
+    return $?
+}
+
+# Escape XML special characters - platform-independent approach
 escape_xml() {
-    sed &apos;s/&amp;/\&amp;amp;/g; s/&lt;/\&amp;lt;/g; s/&gt;/\&amp;gt;/g; s/&quot;/\&amp;quot;/g; s/&apos;\&apos;&apos;/\&amp;apos;/g&apos; &quot;$1&quot; 2&gt;/dev/null
+    local file="$1"
+    local output="$2"
+    
+    # Process the file line by line to handle encoding issues
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        echo "${line}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g; s/'\''/\&apos;/g' >> "$output"
+    done < "$file"
+    
+    return $?
+}
+
+# Detect file language for markdown code blocks
+detect_language() {
+    local file="$1"
+    local base=$(basename "$file")
+    local ext="${file##*.}"
+    
+    # Handle special filenames first
+    case "$base" in
+        Dockerfile|dockerfile) echo "dockerfile"; return ;;
+        Makefile|makefile) echo "makefile"; return ;;
+        .gitignore|.dockerignore) echo "gitignore"; return ;;
+        Vagrantfile) echo "ruby"; return ;;
+        .bashrc|.zshrc|.bash_profile) echo "bash"; return ;;
+        CMakeLists.txt) echo "cmake"; return ;;
+    esac
+    
+    # Handle by extension
+    if [[ "$ext" != "$file" ]]; then
+        case "$ext" in
+            js|mjs|cjs) echo "javascript" ;;
+            jsx) echo "jsx" ;;
+            ts) echo "typescript" ;;
+            tsx) echo "tsx" ;;
+            py) echo "python" ;;
+            rb) echo "ruby" ;;
+            php) echo "php" ;;
+            java) echo "java" ;;
+            c|h) echo "c" ;;
+            cpp|cc|cxx|hpp) echo "cpp" ;;
+            cs) echo "csharp" ;;
+            go) echo "go" ;;
+            rs) echo "rust" ;;
+            swift) echo "swift" ;;
+            kt|kts) echo "kotlin" ;;
+            sh|bash) echo "bash" ;;
+            ps1) echo "powershell" ;;
+            html|htm) echo "html" ;;
+            css) echo "css" ;;
+            scss|sass) echo "scss" ;;
+            sql) echo "sql" ;;
+            md|markdown) echo "markdown" ;;
+            xml|svg) echo "xml" ;;
+            json) echo "json" ;;
+            yaml|yml) echo "yaml" ;;
+            conf|config|ini) echo "ini" ;;
+            toml) echo "toml" ;;
+            lua) echo "lua" ;;
+            pl|pm) echo "perl" ;;
+            dart) echo "dart" ;;
+            r) echo "r" ;;
+            gradle) echo "gradle" ;;
+            scala) echo "scala" ;;
+            clj) echo "clojure" ;;
+            ex|exs) echo "elixir" ;;
+            hs) echo "haskell" ;;
+            *) echo "text" ;;
+        esac
+    else
+        echo "text"  # No extension
+    fi
 }
 
 # Main script
 # ==========
 
-# Ensure SOURCE_DIR is absolute path
-if [[ ! &quot;$SOURCE_DIR&quot; = /* ]]; then
-    SOURCE_DIR=&quot;$(pwd)/$SOURCE_DIR&quot;
+# Ensure SOURCE_DIR is absolute path and exists
+SOURCE_DIR=$(cd "$SOURCE_DIR" 2>/dev/null && pwd || echo "")
+if [ -z "$SOURCE_DIR" ]; then
+    die "Directory not found or inaccessible: $1"
 fi
 
 # Create a temporary file for the output to handle potential clipboard failures
 TMP_FILE=$(mktemp)
-trap &apos;rm -f &quot;$TMP_FILE&quot;&apos; EXIT
+TMP_PROCESSING=$(mktemp)
+trap 'rm -f "$TMP_FILE" "$TMP_PROCESSING"; exit' EXIT INT TERM
 
+echo "Scanning directory: $SOURCE_DIR" >&2
+echo "Output format: $FORMAT" >&2
+echo "Max file size: $(numfmt --to=iec-i --suffix=B $MAX_FILE_SIZE 2>/dev/null || echo "$MAX_FILE_SIZE bytes")" >&2
+echo "Starting file scan..." >&2
+
+# Start the output based on format
+if [[ "$FORMAT" == "xml" ]]; then
+    echo "<files>" > "$TMP_FILE"
+    echo "<!-- Generated by filesc v${VERSION} on $(date "+%Y-%m-%d %H:%M:%S") -->" >> "$TMP_FILE"
+    echo "<!-- Repository: $SOURCE_DIR -->" >> "$TMP_FILE"
+else # markdown
+    echo "# Files from: $SOURCE_DIR" > "$TMP_FILE"
+    echo "# Generated on: $(date "+%Y-%m-%d %H:%M:%S")" >> "$TMP_FILE"
+    echo "# Generated by: filesc v${VERSION}" >> "$TMP_FILE"
+    echo "" >> "$TMP_FILE"
+fi
+
+# Build exclude arguments for find command based on platform
+FIND_ARGS=()
+if [[ "$(uname)" == "Darwin" ]]; then
+    # macOS/BSD find
+    for dir in "${EXCLUDE_DIRS[@]}"; do
+        FIND_ARGS+=(-not -path "*/$dir/*")
+    done
+else
+    # GNU find
+    for dir in "${EXCLUDE_DIRS[@]}"; do
+        FIND_ARGS+=(-not -path "*/$dir/*")
+    done
+fi
+
+# Process files - with file count limit to prevent extremely large outputs
+MAX_FILES=500
+TIMEOUT=30  # seconds
+
+# Safer file processing loop with timeout
 {
-    echo &quot;&lt;files&gt;&quot;
-    # Use -L to follow symlinks, check error code of find
-    find -L &quot;$SOURCE_DIR&quot; \
-        -not -path &quot;*/\.git/*&quot; \
-        -not -path &quot;*/\.svn/*&quot; \
-        -not -path &quot;*/\.vscode/*&quot; \
-        -not -path &quot;*/\.idea/*&quot; \
-        -not -path &quot;*/node_modules/*&quot; \
-        -not -path &quot;*/venv/*&quot; \
-        -not -path &quot;*/\.venv/*&quot; \
-        -not -path &quot;*/build/*&quot; \
-        -not -path &quot;*/dist/*&quot; \
-        -not -path &quot;*/out/*&quot; \
-        -not -path &quot;*/\.next/*&quot; \
-        -not -path &quot;*/coverage/*&quot; \
-        -type f -print0 2&gt;/dev/null | while IFS= read -r -d &apos;&apos; file; do
+    # Use timeout if available
+    if command -v timeout >/dev/null 2>&1; then
+        timeout $TIMEOUT find "$SOURCE_DIR" -type f "${FIND_ARGS[@]}" -print0 2>/dev/null
+    else
+        # No timeout command, regular find
+        find "$SOURCE_DIR" -type f "${FIND_ARGS[@]}" -print0 2>/dev/null
+    fi
+} | {
+    while IFS= read -r -d $'\0' file && [ $PROCESSED -lt $MAX_FILES ]; do
         # Skip files without read permission
-        if [ ! -r &quot;$file&quot; ]; then
-            echo &quot;Skipping (no read permission): $file&quot; &gt;&amp;2
+        if [ ! -r "$file" ]; then
+            echo "Skipping (no read permission): $file" >&2
+            SKIPPED=$((SKIPPED+1))
             continue
         fi
         
         # Get relative path for display and output
-        rel_path=$(get_relative_path &quot;$file&quot;)
+        rel_path=$(get_relative_path "$file")
         
         # Apply filters
-        if in_excluded_directory &quot;$file&quot;; then
+        if in_excluded_directory "$file"; then
+            SKIPPED=$((SKIPPED+1))
             continue
         fi
         
-        if has_excluded_extension &quot;$file&quot;; then
+        if has_excluded_extension "$file"; then
+            SKIPPED=$((SKIPPED+1))
             continue
         fi
         
-        if is_binary &quot;$file&quot;; then
+        if is_binary "$file"; then
+            SKIPPED=$((SKIPPED+1))
             continue
         fi
         
-        if is_too_large &quot;$file&quot;; then
+        if is_too_large "$file"; then
+            SKIPPED=$((SKIPPED+1))
             continue
         fi
         
         # Process file
-        echo &quot;Processing: $rel_path&quot; &gt;&amp;2
-        echo &quot;&lt;file path=\&quot;$rel_path\&quot;&gt;&quot;
+        echo "Processing: $rel_path" >&2
         
-        # Capture error details if cat fails
-        if ! escape_xml &quot;$file&quot;; then
-            error=$?
-            echo &quot;Unable to read file content: $rel_path (error code: $error)&quot;
-            if [ ! -r &quot;$file&quot; ]; then
-                echo &quot;Reason: File access permission denied&quot;
-            elif [ ! -f &quot;$file&quot; ]; then
-                echo &quot;Reason: Not a regular file&quot;
+        if [[ "$FORMAT" == "xml" ]]; then
+            # XML format
+            echo "<file path=\"$rel_path\">" >> "$TMP_FILE"
+            rm -f "$TMP_PROCESSING"
+            if ! escape_xml "$file" "$TMP_PROCESSING"; then
+                error=$?
+                echo "<!-- Error: Unable to read file content (error code: $error) -->" >> "$TMP_FILE"
+                ERRORS=$((ERRORS+1))
             else
-                echo &quot;Reason: Unknown read error&quot;
+                cat "$TMP_PROCESSING" >> "$TMP_FILE"
             fi
+            echo "</file>" >> "$TMP_FILE"
+        else
+            # Markdown format
+            lang=$(detect_language "$rel_path")
+            echo "## File: \`$rel_path\`" >> "$TMP_FILE"
+            echo "" >> "$TMP_FILE"
+            echo '```'"$lang" >> "$TMP_FILE"
+            rm -f "$TMP_PROCESSING"
+            if ! safe_read "$file" "$TMP_PROCESSING"; then
+                error=$?
+                echo "ERROR: Unable to read file content (error code: $error)" >> "$TMP_FILE"
+                ERRORS=$((ERRORS+1))
+            else
+                cat "$TMP_PROCESSING" >> "$TMP_FILE"
+            fi
+            echo '```' >> "$TMP_FILE"
+            echo "" >> "$TMP_FILE"
         fi
         
-        echo &quot;&lt;/file&gt;&quot;
+        PROCESSED=$((PROCESSED+1))
+        
+        # Update progress periodically
+        if [[ $((PROCESSED % 10)) -eq 0 ]]; then
+            echo "Progress: $PROCESSED files processed..." >&2
+        fi
     done
     
-    if [ $? -ne 0 ]; then
-        echo &quot;Warning: Find command may not have completed successfully&quot; &gt;&amp;2
+    # Check if we hit the file limit
+    if [ $PROCESSED -ge $MAX_FILES ]; then
+        echo "Warning: Reached limit of $MAX_FILES files. Only the first $MAX_FILES files were processed." >&2
+        if [[ "$FORMAT" == "xml" ]]; then
+            echo "<!-- Note: Only the first $MAX_FILES files were processed due to file limit -->" >> "$TMP_FILE"
+        else
+            echo "---" >> "$TMP_FILE"
+            echo "**Note:** Only the first $MAX_FILES files were processed due to file limit." >> "$TMP_FILE"
+        fi
     fi
-    
-    echo &quot;&lt;/files&gt;&quot;
-} &gt; &quot;$TMP_FILE&quot;
+}
 
-# Use the appropriate clipboard command
-if ! cat &quot;$TMP_FILE&quot; | eval &quot;$CLIP_CMD&quot;; then
-    die &quot;Failed to copy to clipboard using $CLIP_CMD&quot;
+# If timeout occurred, add a note
+if [ $? -eq 124 ]; then
+    echo "Warning: Process timed out after $TIMEOUT seconds. Output may be incomplete." >&2
+    if [[ "$FORMAT" == "xml" ]]; then
+        echo "<!-- Warning: Process timed out after $TIMEOUT seconds. Output may be incomplete. -->" >> "$TMP_FILE"
+    else
+        echo "---" >> "$TMP_FILE"
+        echo "**Warning:** Process timed out after $TIMEOUT seconds. Output may be incomplete." >> "$TMP_FILE"
+    fi
 fi
 
-echo &quot;Done. Result copied to clipboard ($(wc -l &lt; &quot;$TMP_FILE&quot;) lines)&quot; &gt;&amp;2
+# Finish the output based on format
+if [[ "$FORMAT" == "xml" ]]; then
+    echo "</files>" >> "$TMP_FILE"
+fi
+
+# Check if any files were processed
+if [ "$PROCESSED" -eq 0 ]; then
+    echo "Warning: No files were processed. Check your filters and directory." >&2
+    if [[ "$FORMAT" == "xml" ]]; then
+        echo "<message>No files were processed. Check your filters and directory.</message>" > "$TMP_FILE"
+    else
+        echo "# No files were processed" > "$TMP_FILE"
+        echo "" >> "$TMP_FILE"
+        echo "No files were processed. Check your filters and directory." >> "$TMP_FILE"
+    fi
+fi
+
+# Use the appropriate clipboard command - with timeout to prevent hanging
+if command -v timeout >/dev/null 2>&1; then
+    if ! timeout 5 bash -c "cat \"$TMP_FILE\" | $CLIP_CMD"; then
+        die "Failed to copy to clipboard using $CLIP_CMD"
+    fi
+else
+    if ! cat "$TMP_FILE" | eval "$CLIP_CMD"; then
+        die "Failed to copy to clipboard using $CLIP_CMD"
+    fi
+fi
+
+# Get output file size
+FILE_SIZE=$(wc -c < "$TMP_FILE" | tr -d ' ')
+if command -v numfmt >/dev/null 2>&1; then
+    HUMAN_SIZE=$(numfmt --to=iec-i --suffix=B "$FILE_SIZE")
+else
+    HUMAN_SIZE="${FILE_SIZE} bytes"
+fi
+
+# Report statistics
+echo "" >&2
+echo "Done! Stats:" >&2
+echo "- Files processed: $PROCESSED" >&2
+echo "- Files skipped: $SKIPPED" >&2
+if [ "$ERRORS" -gt 0 ]; then
+    echo "- Errors encountered: $ERRORS" >&2
+fi
+echo "- Output size: $(wc -l < "$TMP_FILE") lines, $HUMAN_SIZE" >&2
+echo "Result copied to clipboard in $FORMAT format." >&2
+
+# Exit cleanly
+exit 0
